@@ -1018,6 +1018,21 @@ int repack_bootimg_mem(const char *orig_boot_path,
         // The trailing AVB footer is handled separately below. Keep the
         // temporary buffer zero-filled there and scan only actual payload.
         uint32_t rest_payload_size = rest_data_size > sizeof(avb) ? rest_data_size - sizeof(avb) : 0;
+
+        // For an AVB image the real payload ends at the vbmeta blob.  Anything
+        // after that is partition padding and must not be treated as data: a
+        // dumped partition often has 0xFF there, which made the backward scan
+        // below think the whole tail was used and pushed the AVB footer past
+        // the end of the image.
+        if (has_avb) {
+            uint64_t vbmeta_end = avb_read_be64(avb.vbmeta_offset) +
+                                  avb_read_be64(avb.vbmeta_size);
+            if (vbmeta_end > rest_data_offset &&
+                vbmeta_end - rest_data_offset <= rest_payload_size) {
+                rest_payload_size = (uint32_t)(vbmeta_end - rest_data_offset);
+            }
+        }
+
         fread(rest_buf_tmp, 1, rest_payload_size, f_orig);
         for (int32_t i = (int32_t)rest_payload_size - 1; i >= 0; i--) {
             if (rest_buf_tmp[i] != 0) {
@@ -1029,7 +1044,9 @@ int repack_bootimg_mem(const char *orig_boot_path,
             tools_logi("warning: overload size of rest data, kptools may crash,Rest data size: %u bytes, Actual used size: %u bytes\n", rest_data_size, rest_buf_offset);
 
             rest_buf = rest_buf_tmp;
-            rest_data_size = rest_buf_offset + sizeof(avb);
+            // The AVB footer is written separately below.  Do not count it
+            // here, otherwise the last 64 bytes of data overlap the footer.
+            rest_data_size = rest_buf_offset;
 
         }else{
             rest_buf = malloc(rest_buf_offset);
@@ -1041,10 +1058,20 @@ int repack_bootimg_mem(const char *orig_boot_path,
 
     }
 
-    // The tail is written verbatim, so the output keeps the original image size
-    // unless a bigger kernel pushes it past the old end of the image.
-    if (rest_buf && page_size + (long)new_k_total_aligned + rest_data_size > total_size) {
-        total_size = ALIGN(page_size + (long)new_k_total_aligned + rest_data_size, (long)page_size);
+    // The tail is written verbatim.  For an AVB image the footer must stay at
+    // the end of the original partition, so never grow it: use the existing
+    // padding before the footer.  For non-AVB images keep the old behaviour
+    // and grow when the kernel no longer fits.
+    long need = page_size + (long)new_k_total_aligned + rest_data_size;
+    if (has_avb) {
+        if (need > total_size - (long)sizeof(avb)) {
+            tools_loge("Kernel too large for boot partition: need %ld bytes, "
+                       "only %ld available before AVB footer\n",
+                       need, total_size - (long)sizeof(avb));
+            return -6;
+        }
+    } else if (rest_buf && need > total_size) {
+        total_size = ALIGN(need, (long)page_size);
         tools_logi("Tail no longer fits, growing image to %ld bytes\n", total_size);
     }
 
